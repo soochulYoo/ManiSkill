@@ -34,6 +34,18 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 import tyro
 
+
+def decompose_force(force6: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Combines the two 3D fingertip contact forces (left, right) into one net force, decomposed
+    into unit direction (3) + magnitude (1). Input (..., 6) = [left_xyz, right_xyz] -> output
+    (..., 4) = [dir_x, dir_y, dir_z, magnitude]."""
+    net_force = force6[..., 0:3] + force6[..., 3:6]
+    magnitude = torch.linalg.norm(net_force, dim=-1, keepdim=True) 
+    direction = net_force / (magnitude + eps)
+    log_magnitude = torch.log1p(magnitude)
+    contact = (magnitude > 0.1).float()
+    return torch.cat([direction, log_magnitude, contact], dim=-1)
+
 @dataclass
 class Args:
     exp_name: Optional[str] = None
@@ -46,7 +58,7 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ManiSkill"
+    wandb_project_name: str = "ManiSkill_ACT"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -79,6 +91,22 @@ class Args:
     masks: bool = False
     dilation: bool = False
     include_depth: bool = True
+    include_force: bool = True
+    """Whether to include contact force as its own conditioning token in the model (see
+    DETRVAE's force_dim), rather than folding it into the flat state vector like other extra
+    fields. The two fingertip contact forces are combined into one net force and decomposed into
+    direction (3) + magnitude (1). Requires the demo dataset/env to expose `finger_contact_forces`."""
+    use_force_magnitude_head: bool = False
+    """Whether to add an auxiliary head that predicts the next timestep's force magnitude from the
+    current one (self-supervised: needs only the magnitude sequence, no extra labels), trained
+    jointly with the main behavior cloning loss. Only meaningful if include_force is True. This is
+    the head Test-Time Training adapts online at eval time (see eval_friction_sweep.py)."""
+    force_magnitude_loss_weight: float = 1.0
+    """Weight for the auxiliary force-magnitude-prediction loss, only used if
+    use_force_magnitude_head is True."""
+    force_hidden_dim: int = 64
+    """Hidden size of the ForceMagnitudeEncoder (the small MLP that encodes force magnitude and
+    that Test-Time Training adapts)."""
 
     # Transformer
     enc_layers: int = 2
@@ -127,12 +155,13 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
     Note that the returned observations will have a "rgbd" or "rgb" or "depth" key depending on the rgb/depth bool flags.
     """
 
-    def __init__(self, env, rgb=True, depth=True, state=True) -> None:
+    def __init__(self, env, rgb=True, depth=False, state=True, force=True) -> None:
         self.base_env: BaseEnv = env.unwrapped
         super().__init__(env)
         self.include_rgb = rgb
         self.include_depth = depth
         self.include_state = state
+        self.include_force = force
         self.transforms = T.Compose(
             [
                 T.Resize((224, 224), antialias=True),
@@ -144,6 +173,9 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
     def observation(self, observation: Dict):
         sensor_data = observation.pop("sensor_data")
         del observation["sensor_param"]
+        force = None
+        if self.include_force:
+            force = decompose_force(observation["extra"].pop("finger_contact_forces"))
         images_rgb = []
         images_depth = []
         for cam_data in sensor_data.values():
@@ -168,6 +200,8 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
         ret = dict()
         if self.include_state:
             ret["state"] = observation
+        if self.include_force:
+            ret["force"] = force
         if self.include_rgb and not self.include_depth:
             ret["rgb"] = rgb
         elif self.include_rgb and self.include_depth:
@@ -179,7 +213,7 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
 
 
 class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
-    def __init__(self, data_path, num_queries, num_traj, include_depth=True):
+    def __init__(self, data_path, num_queries, num_traj, include_depth=True, include_force=True, use_force_magnitude_head=False):
         if data_path[-4:] == '.pkl':
             raise NotImplementedError()
         else:
@@ -190,6 +224,8 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         print('Raw trajectory loaded, start to pre-process the observations...')
 
         self.include_depth = include_depth
+        self.include_force = include_force
+        self.use_force_magnitude_head = include_force and use_force_magnitude_head
         self.transforms = T.Compose(
             [
                 T.Resize((224, 224), antialias=True),
@@ -252,9 +288,32 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
                 target = act_seq[-1]
                 act_seq = torch.cat([act_seq, target.repeat(self.num_queries-action_len, 1)], dim=0)
 
-        # normalize state and act_seq
+        # get force at start_ts, and (if training the magnitude head) the next num_queries steps of
+        # [log_magnitude, contact] as the multi-step self-supervised prediction target -- mirrors
+        # act_seq itself being a chunk of num_queries future actions, padded the same way past the
+        # end of the episode (repeat the last available value). Observations have episode_len+1
+        # entries while ts ranges over the episode_len action indices, so ts+1 is always in-bounds
+        # even when the full window isn't.
+        if self.include_force:
+            force = self.trajectories['observations'][traj_idx]['force'][ts]
+            if self.use_force_magnitude_head:
+                future_force = self.trajectories['observations'][traj_idx]['force'][ts + 1: ts + 1 + self.num_queries]
+                future_len = future_force.shape[0]
+                if future_len < self.num_queries:
+                    pad = future_force[-1:].repeat(self.num_queries - future_len, 1)
+                    future_force = torch.cat([future_force, pad], dim=0)
+
+        # normalize state, force (magnitude component only -- direction is already a unit vector
+        # and contact is already a clean 0/1 flag, neither needs/wants z-score normalization), and
+        # act_seq
         if not self.delta_control:
             state = (state - self.norm_stats["state_mean"][0]) / self.norm_stats["state_std"][0]
+            if self.include_force:
+                force = force.clone()
+                force[3:4] = (force[3:4] - self.norm_stats["force_magnitude_mean"][0]) / self.norm_stats["force_magnitude_std"][0]
+                if self.use_force_magnitude_head:
+                    future_force = future_force.clone()
+                    future_force[:, 3:4] = (future_force[:, 3:4] - self.norm_stats["force_magnitude_mean"][0]) / self.norm_stats["force_magnitude_std"][0]
             act_seq = (act_seq - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
         # get rgb or rgbd data at start_ts and combine with state to form obs
@@ -265,11 +324,17 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         else:
             rgb = self.trajectories['observations'][traj_idx]['rgb'][ts]
             obs = dict(state=state, rgb=rgb)
+        if self.include_force:
+            obs['force'] = force
 
-        return {
+        item = {
             'observations': obs,
             'actions': act_seq,
         }
+        if self.use_force_magnitude_head:
+            item['next_force_magnitude'] = future_force[:, 3:4] # (num_queries, 1), normalized log-magnitude
+            item['next_force_contact'] = future_force[:, 4:5]   # (num_queries, 1), binary mask, unnormalized
+        return item
 
     def __len__(self):
         return len(self.slices)
@@ -278,6 +343,12 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         # get rgbd data
         sensor_data = obs_dict.pop("sensor_data")
         del obs_dict["sensor_param"]
+        force = None
+        if self.include_force:
+            # pulled out before flattening so it stays its own modality instead of getting
+            # folded into the flat "state" vector along with the rest of obs_dict['extra']
+            raw_force = torch.from_numpy(obs_dict['extra'].pop('finger_contact_forces')).float() # (ep_len, 6)
+            force = decompose_force(raw_force) # (ep_len, 5) = [dir_x, dir_y, dir_z, log_magnitude, contact]
         images_rgb = []
         images_depth = []
         for cam_data in sensor_data.values():
@@ -301,12 +372,15 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         obs_dict = common.flatten_state_dict(obs_dict, use_torch=True)
 
         processed_obs = dict(state=obs_dict, rgb=rgb, depth=depth) if self.include_depth else dict(state=obs_dict, rgb=rgb)
+        if self.include_force:
+            processed_obs['force'] = force
 
         return processed_obs
 
     def get_norm_stats(self):
         all_state_data = []
         all_action_data = []
+        all_force_data = [] if self.include_force else None
         for traj_idx, ts in self.slices:
             state = self.trajectories['observations'][traj_idx]['state'][ts]
             act_seq = self.trajectories['actions'][traj_idx][ts:ts+self.num_queries]
@@ -316,6 +390,8 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
                 act_seq = torch.cat([act_seq, target_pos.repeat(self.num_queries-action_len, 1)], dim=0)
             all_state_data.append(state)
             all_action_data.append(act_seq)
+            if self.include_force:
+                all_force_data.append(self.trajectories['observations'][traj_idx]['force'][ts])
 
         all_state_data = torch.stack(all_state_data)
         all_action_data = torch.concatenate(all_action_data)
@@ -334,6 +410,17 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
                  "state_mean": state_mean, "state_std": state_std,
                  "example_state": state}
 
+        if self.include_force:
+            # only the (log-)magnitude component gets normalized: direction is already a unit
+            # vector and contact is already a clean 0/1 flag, so z-scoring either would just
+            # distort a representation that's already well-scaled.
+            all_force_data = torch.stack(all_force_data) # (N, 5) = [dir(3), log_magnitude(1), contact(1)]
+            force_magnitude_mean = all_force_data[:, 3:4].mean(dim=0, keepdim=True)
+            force_magnitude_std = all_force_data[:, 3:4].std(dim=0, keepdim=True)
+            force_magnitude_std = torch.clip(force_magnitude_std, 1e-2, np.inf) # clipping
+            stats["force_magnitude_mean"] = force_magnitude_mean
+            stats["force_magnitude_std"] = force_magnitude_std
+
         return stats
 
 
@@ -347,6 +434,14 @@ class Agent(nn.Module):
 
         self.state_dim = env.single_observation_space['state'].shape[0]
         self.act_dim = env.single_action_space.shape[0]
+        self.include_force = args.include_force
+        self.use_force_magnitude_head = args.include_force and args.use_force_magnitude_head
+        self.force_magnitude_loss_weight = args.force_magnitude_loss_weight
+        if self.include_force:
+            assert len(env.single_observation_space['force'].shape) == 1 # (force_dim,) = direction(3) + magnitude(1)
+            self.force_dim = env.single_observation_space['force'].shape[0]
+        else:
+            self.force_dim = None
         self.kl_weight = args.kl_weight
         self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -370,9 +465,12 @@ class Agent(nn.Module):
             state_dim=self.state_dim,
             action_dim=self.act_dim,
             num_queries=args.num_queries,
+            force_dim=self.force_dim,
+            force_hidden_dim=args.force_hidden_dim,
+            use_force_magnitude_head=self.use_force_magnitude_head,
         )
 
-    def compute_loss(self, obs, action_seq):
+    def compute_loss(self, obs, action_seq, next_force_magnitude=None, next_force_contact=None):
         # normalize rgb data
         obs['rgb'] = obs['rgb'].float() / 255.0
         obs['rgb'] = self.normalize(obs['rgb'])
@@ -381,8 +479,12 @@ class Agent(nn.Module):
         if args.include_depth:
             obs['depth'] = obs['depth'].float()
 
+        # force data
+        if self.include_force:
+            obs['force'] = obs['force'].float()
+
         # forward pass
-        a_hat, (mu, logvar) = self.model(obs, action_seq)
+        a_hat, (mu, logvar), force_magnitude_pred = self.model(obs, action_seq)
 
         # compute l1 loss and kl loss
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
@@ -394,6 +496,19 @@ class Agent(nn.Module):
         loss_dict['l1'] = l1
         loss_dict['kl'] = total_kld[0]
         loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+        if self.use_force_magnitude_head:
+            # self-supervised auxiliary task: predict the next num_queries steps of force
+            # magnitude from the current one (same chunk length as the action head). Masked by
+            # the *future* contact flag so the loss only trains on windows that actually involve
+            # contact -- long no-contact stretches would otherwise dominate the auxiliary loss
+            # with the trivial "predict zero" case and drown out the few informative
+            # contact-transition regions. Same masked task used for Test-Time Training at eval
+            # time (see eval_friction_sweep.py).
+            all_mse = F.mse_loss(force_magnitude_pred, next_force_magnitude.float(), reduction='none')
+            contact_mask = next_force_contact.float()
+            force_magnitude_loss = (all_mse * contact_mask).sum() / contact_mask.sum().clamp(min=1)
+            loss_dict['force_magnitude_pred'] = force_magnitude_loss
+            loss_dict['loss'] = loss_dict['loss'] + force_magnitude_loss * self.force_magnitude_loss_weight
         return loss_dict
 
     def get_action(self, obs):
@@ -405,8 +520,12 @@ class Agent(nn.Module):
         if args.include_depth:
             obs['depth'] = obs['depth'].float()
 
+        # force data
+        if self.include_force:
+            obs['force'] = obs['force'].float()
+
         # forward pass
-        a_hat, (_, _) = self.model(obs) # no action, sample from prior
+        a_hat, (_, _), _ = self.model(obs) # no action, sample from prior
 
         return a_hat
 
@@ -470,11 +589,11 @@ if __name__ == "__main__":
     if args.max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
     other_kwargs = None
-    wrappers = [partial(FlattenRGBDObservationWrapper, depth=args.include_depth)]
+    wrappers = [partial(FlattenRGBDObservationWrapper, depth=args.include_depth, force=args.include_force)]
     envs = make_eval_envs(args.env_id, args.num_eval_envs, args.sim_backend, env_kwargs, other_kwargs, video_dir=f'runs/{run_name}/videos' if args.capture_video else None, wrappers=wrappers)
 
     # dataloader setup
-    dataset = SmallDemoDataset_ACTPolicy(args.demo_path, args.num_queries, num_traj=args.num_demos, include_depth=args.include_depth)
+    dataset = SmallDemoDataset_ACTPolicy(args.demo_path, args.num_queries, num_traj=args.num_demos, include_depth=args.include_depth, include_force=args.include_force, use_force_magnitude_head=args.use_force_magnitude_head)
     sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
@@ -556,11 +675,15 @@ if __name__ == "__main__":
         obs_batch_dict = data_batch['observations']
         obs_batch_dict = {k: v.cuda(non_blocking=True) for k, v in obs_batch_dict.items()}
         act_batch = data_batch['actions'].cuda(non_blocking=True)
+        next_force_magnitude_batch = data_batch['next_force_magnitude'].cuda(non_blocking=True) if args.use_force_magnitude_head else None
+        next_force_contact_batch = data_batch['next_force_contact'].cuda(non_blocking=True) if args.use_force_magnitude_head else None
 
         # forward and compute loss
         loss_dict = agent.compute_loss(
             obs=obs_batch_dict, # obs_batch_dict['state'] is (B, obs_dim)
             action_seq=act_batch, # (B, num_queries, act_dim)
+            next_force_magnitude=next_force_magnitude_batch,
+            next_force_contact=next_force_contact_batch,
         )
         total_loss = loss_dict['loss']  # total_loss = l1 + kl * self.kl_weight
 
@@ -601,6 +724,8 @@ if __name__ == "__main__":
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], cur_iter)
             writer.add_scalar("charts/backbone_learning_rate", optimizer.param_groups[1]["lr"], cur_iter)
             writer.add_scalar("losses/total_loss", total_loss.item(), cur_iter)
+            if args.use_force_magnitude_head:
+                writer.add_scalar("losses/force_magnitude_pred", loss_dict['force_magnitude_pred'].item(), cur_iter)
             for k, v in timings.items():
                 writer.add_scalar(f"time/{k}", v, cur_iter)
 

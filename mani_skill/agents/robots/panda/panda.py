@@ -73,6 +73,22 @@ class Panda(BaseAgent):
     gripper_damping = 1e2
     gripper_force_limit = 100
 
+    # NOTE (compliance controller): these are Cartesian (task-space) gains applied as explicit
+    # joint torques (qf) every physics substep, not PhysX's implicit joint drive, so they are
+    # subject to ordinary explicit-integration stability limits at the simulation's timestep
+    # (100Hz by default). Panda's wrist joints have low inertia, so rot_stiffness and
+    # joint_damping in particular go numerically unstable above ~4-5 and ~3 respectively at
+    # that timestep; these values were empirically tuned (including under real contact with
+    # the table/objects, not just free-space) to hold/settle without divergence or significant
+    # overshoot at the default sim_freq.
+    arm_ee_pos_stiffness = 150.0
+    arm_ee_pos_damping = 8.0
+    arm_ee_rot_stiffness = 3.0
+    arm_ee_rot_damping = 0.8
+    arm_ee_nullspace_stiffness = 5.0
+    arm_ee_joint_damping = 2.0
+    arm_ee_force_limit = 60.0
+
     @property
     def _controller_configs(self):
         # -------------------------------------------------------------------------- #
@@ -140,6 +156,42 @@ class Panda(BaseAgent):
         arm_pd_ee_target_delta_pose = deepcopy(arm_pd_ee_delta_pose)
         arm_pd_ee_target_delta_pose.use_target = True
 
+        # PD ee pose compliance (Cartesian impedance) control
+        arm_pd_ee_delta_pose_compliance = PDEEPoseComplianceControllerConfig(
+            joint_names=self.arm_joint_names,
+            pos_lower=-0.1,
+            pos_upper=0.1,
+            rot_lower=-0.1,
+            rot_upper=0.1,
+            pos_stiffness=self.arm_ee_pos_stiffness,
+            pos_damping=self.arm_ee_pos_damping,
+            rot_stiffness=self.arm_ee_rot_stiffness,
+            rot_damping=self.arm_ee_rot_damping,
+            nullspace_stiffness=self.arm_ee_nullspace_stiffness,
+            joint_damping=self.arm_ee_joint_damping,
+            force_limit=self.arm_ee_force_limit,
+            ee_link=self.ee_link_name,
+            urdf_path=cast(str, self.urdf_path),
+        )
+        arm_pd_ee_pose_compliance = PDEEPoseComplianceControllerConfig(
+            joint_names=self.arm_joint_names,
+            pos_lower=-2.0,
+            pos_upper=2.0,
+            rot_lower=-2 * np.pi,
+            rot_upper=2 * np.pi,
+            pos_stiffness=self.arm_ee_pos_stiffness,
+            pos_damping=self.arm_ee_pos_damping,
+            rot_stiffness=self.arm_ee_rot_stiffness,
+            rot_damping=self.arm_ee_rot_damping,
+            nullspace_stiffness=self.arm_ee_nullspace_stiffness,
+            joint_damping=self.arm_ee_joint_damping,
+            force_limit=self.arm_ee_force_limit,
+            ee_link=self.ee_link_name,
+            urdf_path=cast(str, self.urdf_path),
+            use_delta=False,
+            normalize_action=False,
+        )
+
         # PD joint velocity
         arm_pd_joint_vel = PDJointVelControllerConfig(
             self.arm_joint_names,
@@ -194,6 +246,12 @@ class Panda(BaseAgent):
                 arm=arm_pd_ee_delta_pose, gripper=gripper_pd_joint_pos
             ),
             pd_ee_pose=dict(arm=arm_pd_ee_pose, gripper=gripper_pd_joint_pos),
+            pd_ee_delta_pose_compliance=dict(
+                arm=arm_pd_ee_delta_pose_compliance, gripper=gripper_pd_joint_pos
+            ),
+            pd_ee_pose_compliance=dict(
+                arm=arm_pd_ee_pose_compliance, gripper=gripper_pd_joint_pos
+            ),
             # TODO(jigu): how to add boundaries for the following controllers
             pd_joint_target_delta_pos=dict(
                 arm=arm_pd_joint_target_delta_pos, gripper=gripper_pd_joint_pos

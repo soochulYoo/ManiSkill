@@ -6,6 +6,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
 from typing import Optional, Union, cast
 
+import numpy as np
 from pytorch_kinematics import Transform3d
 
 from mani_skill.utils.geometry import rotation_conversions
@@ -283,3 +284,46 @@ class Kinematics:
                 )
             else:
                 return None
+
+    def compute_jacobian(
+        self, qpos: torch.Tensor, ee_rot_quat: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Computes the geometric Jacobian of the end-effector link (translation stacked
+        on rotation, shape (B, 6, num_active_joints)) mapping active joint velocities to
+        the end-effector's spatial velocity, expressed in the kinematic chain's root frame
+        (i.e. the same frame used by `root_translation:root_aligned_body_rotation` control).
+
+        Args:
+            qpos (torch.Tensor): the full active-joint qpos of the articulation (i.e. what
+                `articulation.get_qpos()` returns), not just the joints this chain controls.
+            ee_rot_quat (Optional[torch.Tensor]): the end-effector's current orientation
+                (as a wxyz quaternion) in the root frame. Required on CPU only, since Pinocchio's
+                Jacobian is computed in the end-effector's local/body frame and must be rotated
+                into the root-aligned frame to match the convention used on GPU.
+        """
+        if self.use_gpu_ik:
+            q0 = qpos[:, self.active_ancestor_joint_idxs]
+            return cast(torch.Tensor, self.pk_chain.jacobian(q0))[:, :, self.qmask]
+        else:
+            assert (
+                ee_rot_quat is not None
+            ), "ee_rot_quat must be provided to compute the Jacobian on CPU"
+            q0 = qpos[:, self.pmodel_active_joint_indices].cpu().numpy()[0]
+            self.pmodel.compute_full_jacobian(q0)
+            # local=True gives the Jacobian correctly located at the end-effector origin but
+            # expressed in the end-effector's own body-frame axes; rotate it into the root-aligned
+            # frame so it is consistent with the GPU backend and with root-frame pose/velocity errors.
+            J_local = self.pmodel.get_link_jacobian(self.end_link_idx, local=True)
+            J_local = J_local[:, self.pmodel_controlled_joint_indices.cpu().numpy()]
+            R = (
+                rotation_conversions.quaternion_to_matrix(ee_rot_quat)[0]
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            J_world = np.zeros_like(J_local)
+            J_world[:3] = R @ J_local[:3]
+            J_world[3:] = R @ J_local[3:]
+            return common.to_tensor(
+                J_world[None].astype(np.float32), device=self.device
+            )

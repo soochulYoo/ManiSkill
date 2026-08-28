@@ -16,8 +16,18 @@ from mani_skill.utils.scene_builder import SceneBuilder
 class TableSceneBuilder(SceneBuilder):
     """A simple scene builder that adds a table to the scene such that the height of the table is at 0, and
     gives reasonable initial poses for robots."""
+    def create_table_material(self, static_friction=0.3, dynamic_friction=0.3):
+        """Creates a PhysxMaterial for the table surface with the given friction coefficients.
+        Note this only sets the table's own material; for an exact/isolated effective contact
+        friction, give any object resting on the table this same material as well, since PhysX
+        combines the two contacting materials' friction values otherwise."""
+        return sapien.physx.PhysxMaterial(
+            static_friction=static_friction,
+            dynamic_friction=dynamic_friction,
+            restitution=0.0,
+        )
 
-    def build(self):
+    def build(self, table_material=None):
         builder = self.scene.create_actor_builder()
         model_dir = Path(osp.dirname(__file__)) / "assets"
         table_model_file = str(model_dir / "table.glb")
@@ -29,10 +39,17 @@ class TableSceneBuilder(SceneBuilder):
         #     scale=[scale] * 3,
         #     pose=table_pose,
         # )
-        builder.add_box_collision(
-            pose=sapien.Pose(p=[0, 0, 0.9196429 / 2]),
-            half_size=(2.418 / 2, 1.209 / 2, 0.9196429 / 2),
-        )
+        if table_material is not None:
+            builder.add_box_collision(
+                pose=sapien.Pose(p=[0, 0, 0.9196429 / 2]),
+                half_size=(2.418 / 2, 1.209 / 2, 0.9196429 / 2),
+                material=table_material,
+            )
+        else:
+            builder.add_box_collision(
+                pose=sapien.Pose(p=[0, 0, 0.9196429 / 2]),
+                half_size=(2.418 / 2, 1.209 / 2, 0.9196429 / 2),
+            )
         builder.add_visual_from_file(
             filename=table_model_file, scale=[scale] * 3, pose=table_pose
         )

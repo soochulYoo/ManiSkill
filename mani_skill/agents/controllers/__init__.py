@@ -12,6 +12,10 @@ from .pd_ee_pose import (
     PDEEPoseController,
     PDEEPoseControllerConfig,
 )
+from .pd_ee_pose_compliance import (
+    PDEEPoseComplianceController,
+    PDEEPoseComplianceControllerConfig,
+)
 from .pd_joint_vel import PDJointVelController, PDJointVelControllerConfig
 from .pd_joint_pos_vel import PDJointPosVelController, PDJointPosVelControllerConfig
 from .passive_controller import PassiveController, PassiveControllerConfig

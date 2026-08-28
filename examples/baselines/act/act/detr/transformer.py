@@ -46,12 +46,18 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
+    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None, extra_tokens=None):
+        # additional_pos_embed has one row per extra (non-vision) token: latent, proprio, and
+        # optionally more (e.g. force direction/magnitude). Its row count must match the number
+        # of tensors stacked below.
+        additional_tokens = [latent_input, proprio_input]
+        if extra_tokens is not None:
+            additional_tokens += extra_tokens
         if src is None:
             bs = proprio_input.shape[0]
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
             pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
-            src = torch.stack([latent_input, proprio_input], axis=0)
+            src = torch.stack(additional_tokens, axis=0)
         # TODO flatten only when input has H and W
         elif len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -64,7 +70,7 @@ class Transformer(nn.Module):
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
-            addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            addition_input = torch.stack(additional_tokens, axis=0)
             src = torch.cat([addition_input, src], axis=0)
 
         tgt = torch.zeros_like(query_embed)

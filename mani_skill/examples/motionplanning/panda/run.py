@@ -3,6 +3,7 @@ import os
 from copy import deepcopy
 import time
 import argparse
+from typing import Any
 import gymnasium as gym
 import numpy as np
 from tqdm import tqdm
@@ -39,12 +40,14 @@ def parse_args(args=None):
     parser.add_argument("--shader", default="default", type=str, help="Change shader used for rendering. Default is 'default' which is very fast. Can also be 'rt' for ray tracing and generating photo-realistic renders. Can also be 'rt-fast' for a faster but lower quality ray-traced renderer")
     parser.add_argument("--record-dir", type=str, default="demos", help="where to save the recorded trajectories")
     parser.add_argument("--num-procs", type=int, default=1, help="Number of processes to use to help parallelize the trajectory replay process. This uses CPU multiprocessing and only works with the CPU simulation backend at the moment.")
+    parser.add_argument("--obj-density", type=float, default=None, help="Density of the manipulated object (e.g. cube/peg). Only supported by environments that accept an `obj_density` kwarg (e.g. PushCube-v1). If unset, the environment's own default is used. Use different values for OOD data collection (e.g., 500, 2000, 2500).")
+    parser.add_argument("--static-friction", type=float, default=None, help="Static friction of the table. Only supported by environments that accept a `static_friction` kwarg (e.g. PushCube-v1). If unset, the environment's own default is used.")
+    parser.add_argument("--dynamic-friction", type=float, default=None, help="Dynamic friction of the table. Only supported by environments that accept a `dynamic_friction` kwarg (e.g. PushCube-v1). If unset, the environment's own default is used.")
     return parser.parse_args()
 
 def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
     env_id = args.env_id
-    env = gym.make(
-        env_id,
+    env_kwargs: dict[str, Any] = dict(
         obs_mode=args.obs_mode,
         control_mode="pd_joint_pos",
         render_mode=args.render_mode,
@@ -53,6 +56,15 @@ def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
         viewer_camera_configs=dict(shader_pack=args.shader),
         sim_backend=args.sim_backend
     )
+    # only forward these if explicitly set, since not every env in MP_SOLUTIONS accepts them
+    # (e.g. PegInsertionSide-v1 does not currently) and gym.make would error on an unknown kwarg
+    if args.obj_density is not None:
+        env_kwargs["obj_density"] = args.obj_density
+    if args.static_friction is not None:
+        env_kwargs["static_friction"] = args.static_friction
+    if args.dynamic_friction is not None:
+        env_kwargs["dynamic_friction"] = args.dynamic_friction
+    env = gym.make(env_id, **env_kwargs)
     if env_id not in MP_SOLUTIONS:
         raise RuntimeError(f"No already written motion planning solutions for {env_id}. Available options are {list(MP_SOLUTIONS.keys())}")
 

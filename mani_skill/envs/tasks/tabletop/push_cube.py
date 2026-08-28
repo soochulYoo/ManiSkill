@@ -46,6 +46,13 @@ class PushCubeEnv(BaseEnv):
 
     **Success Conditions:**
     - the cube's xy position is within goal_radius (default 0.1) of the target's xy position by euclidean distance and the cube is still on the table.
+
+    **Configurable Parameters:**
+    - `obj_density`: density (kg/m^3) of the cube, default 1000.
+    - `static_friction` / `dynamic_friction`: friction coefficients of the table surface, defaults 3.3/2.3.
+      Useful for domain randomization / OOD data collection across friction conditions. Note the cube
+      itself keeps its own default material, so the effective cube-table contact friction is PhysX's
+      combination of the two, not exactly these values.
     """
 
     _sample_video_link = "https://github.com/mani-skill/ManiSkill/raw/main/figures/environment_demos/PushCube-v1_rt.mp4"
@@ -59,9 +66,12 @@ class PushCubeEnv(BaseEnv):
     goal_radius = 0.1
     cube_half_size = 0.02
 
-    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
+    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, obj_density=1000.0, static_friction=3.3, dynamic_friction=2.3, **kwargs):
         # specifying robot_uids="panda" as the default means gym.make("PushCube-v1") will default to using the panda arm.
         self.robot_init_qpos_noise = robot_init_qpos_noise
+        self.obj_density = obj_density
+        self.static_friction = static_friction
+        self.dynamic_friction = dynamic_friction
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     # Specify default simulation/gpu memory configurations to override any default values
@@ -78,6 +88,7 @@ class PushCubeEnv(BaseEnv):
         # registers one 128x128 camera looking at the robot, cube, and target
         # a smaller sized camera will be lower quality, but render faster
         pose = sapien_utils.look_at(eye=[0.3, 0, 0.6], target=[-0.1, 0, 0.1])
+        pose_side = sapien_utils.look_at([0.6, 0.7, 0.6], [0.0, 0.0, 0.35])
         return [
             CameraConfig(
                 "base_camera",
@@ -87,7 +98,16 @@ class PushCubeEnv(BaseEnv):
                 fov=np.pi / 2,
                 near=0.01,
                 far=100,
-            )
+            ),
+            CameraConfig(
+                "side_camera",
+                pose=pose_side,
+                width=128,
+                height=128,
+                fov=1,
+                near=0.01,
+                far=100,
+            ),
         ]
 
     @property
@@ -107,12 +127,18 @@ class PushCubeEnv(BaseEnv):
         self.table_scene = TableSceneBuilder(
             env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
         )
-        self.table_scene.build()
+        table_material = self.table_scene.create_table_material(
+            static_friction=self.static_friction, dynamic_friction=self.dynamic_friction
+        )
+        self.table_scene.build(table_material=table_material)
 
         # we then add the cube that we want to push using the actor builder API
         # convenience functions like actors.build_cube can also build common primitive shapes
         builder = self.scene.create_actor_builder()
-        builder.add_box_collision(half_size=[self.cube_half_size] * 3)
+        builder.add_box_collision(
+            half_size=[self.cube_half_size] * 3,
+            density=self.obj_density,
+        )
         builder.add_box_visual(
             half_size=[self.cube_half_size] * 3,
             material=sapien.render.RenderMaterial(
@@ -197,8 +223,14 @@ class PushCubeEnv(BaseEnv):
     def _get_obs_extra(self, info: dict):
         # some useful observation info for solving the task includes the pose of the tcp (tool center point) which is the point between the
         # grippers of the robot
+        # tcp_contact_forces is the net contact force on each fingertip (flattened [left_xyz, right_xyz]),
+        # exposed regardless of obs_mode so force-aware policies (e.g. ACT with force) can use it
+        # from visual/rgbd data collection too, not just state-based observations.
         obs = dict(
             tcp_pose=self.agent.tcp.pose.raw_pose,
+            finger_contact_forces=self.agent.robot.get_net_contact_forces(
+                ["panda_leftfinger", "panda_rightfinger"]
+            ).reshape(self.num_envs, 6),
         )
         if self.obs_mode_struct.use_state:
             # if the observation mode requests to use state, we provide ground truth information about where the cube is.

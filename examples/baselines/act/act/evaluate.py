@@ -10,11 +10,16 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
 
     use_visual_obs = isinstance(eval_envs.single_observation_space.sample(), dict)
     delta_control = not stats
+    force_pre_process = None
     if not delta_control:
         if sim_backend == "physx_cpu":
             pre_process = lambda s_obs: (s_obs - stats['state_mean'].cpu().numpy()) / stats['state_std'].cpu().numpy()
+            if 'force_mean' in stats:
+                force_pre_process = lambda f_obs: (f_obs - stats['force_mean'].cpu().numpy()) / stats['force_std'].cpu().numpy()
         else:
             pre_process = lambda s_obs: (s_obs - stats['state_mean']) / stats['state_std']
+            if 'force_mean' in stats:
+                force_pre_process = lambda f_obs: (f_obs - stats['force_mean']) / stats['force_std']
         post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
     # create action table for temporal ensembling
@@ -36,6 +41,8 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
             # pre-process obs
             if use_visual_obs:
                 obs['state'] = pre_process(obs['state']) if not delta_control else obs['state']  # (num_envs, obs_dim)
+                if force_pre_process is not None:
+                    obs['force'] = force_pre_process(obs['force'])  # (num_envs, force_dim)
                 obs = {k: common.to_tensor(v, device) for k, v in obs.items()}
             else:
                 obs = pre_process(obs) if not delta_control else obs  # (num_envs, obs_dim)
@@ -77,16 +84,34 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
             obs, rew, terminated, truncated, info = eval_envs.step(action)
             ts += 1
 
-            # collect episode info
+            # collect episode info. ManiSkillVectorEnv (GPU backend) always adds a `final_info`
+            # wrapper (with the terminal step's info nested under `final_info["episode"]`) for
+            # backward compatibility, but gymnasium>=1.0's own vector envs (used for the CPU
+            # backend here) dropped that convention -- their default autoreset mode instead
+            # returns the terminal step's info directly, so `episode` is only ever a *top-level*
+            # key in that case.
             if truncated.any():
                 assert truncated.all() == truncated.any(), "all episodes should truncate at the same time for fair evaluation with other algorithms"
-                if isinstance(info["final_info"], dict):
-                    for k, v in info["final_info"]["episode"].items():
-                        eval_metrics[k].append(v.float().cpu().numpy())
+                if "final_info" in info:
+                    # GPU backend (ManiSkillVectorEnv): the reset already happened synchronously
+                    # inside step() above, so `obs` is already the fresh post-reset observation.
+                    if isinstance(info["final_info"], dict):
+                        for k, v in info["final_info"]["episode"].items():
+                            eval_metrics[k].append(common.to_numpy(v))
+                    else:
+                        for final_info in info["final_info"]:
+                            for k, v in final_info["episode"].items():
+                                eval_metrics[k].append(v)
                 else:
-                    for final_info in info["final_info"]:
-                        for k, v in final_info["episode"].items():
-                            eval_metrics[k].append(v)
+                    # CPU backend: gymnasium>=1.0's default vector-env autoreset mode returns the
+                    # terminal (pre-reset) observation here and only performs the actual reset on
+                    # the NEXT step() call. Relying on that would silently consume one extra
+                    # "phantom" step per episode that doesn't correspond to real environment
+                    # progress, throwing off ts/all_time_actions indexing on the following
+                    # episode. Reset explicitly instead.
+                    for k, v in info["episode"].items():
+                        eval_metrics[k].append(common.to_numpy(v))
+                    obs, info = eval_envs.reset()
                 # new episodes begin
                 eps_count += num_envs
                 ts = 0

@@ -244,7 +244,7 @@ class Agent(nn.Module):
 
     def compute_loss(self, obs, action_seq):
         # forward pass
-        a_hat, (mu, logvar) = self.model(obs, action_seq)
+        a_hat, (mu, logvar), _ = self.model(obs, action_seq)
 
         # compute l1 loss and kl loss
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
@@ -260,7 +260,7 @@ class Agent(nn.Module):
 
     def get_action(self, obs):
         # forward pass
-        a_hat, (_, _) = self.model(obs) # no action, sample from prior
+        a_hat, (_, _), _ = self.model(obs) # no action, sample from prior
         return a_hat
 
 
