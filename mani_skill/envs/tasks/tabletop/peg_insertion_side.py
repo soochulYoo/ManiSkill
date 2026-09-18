@@ -61,12 +61,17 @@ class PegInsertionSideEnv(BaseEnv):
 
     **Success Conditions:**
     - The white end of the peg is within 0.015m of the center of the box (inserted mid way).
+
+    **Configurable Parameters:**
+    - `clearance`: gap (m) between the peg's radius and the hole's inner radius, default 0.003.
+      Smaller values make the hole a tighter fit (less room for error, more reliant on contact
+      feedback to insert successfully); larger values make it looser. Also controls the success
+      tolerance, since the hole's own radius is `peg_radius + clearance`.
     """
 
     _sample_video_link = "https://github.com/mani-skillll/ManiSkill/raw/main/figures/environment_demos/PegInsertionSide-v1_rt.mp4"
     SUPPORTED_ROBOTS = ["panda_wristcam"]
     agent: Union[PandaWristCam]
-    _clearance = 0.003
 
     def __init__(
         self,
@@ -74,8 +79,10 @@ class PegInsertionSideEnv(BaseEnv):
         robot_uids="panda_wristcam",
         num_envs=1,
         reconfiguration_freq=None,
+        clearance=0.003,
         **kwargs,
     ):
+        self.clearance = clearance
         if reconfiguration_freq is None:
             if num_envs == 1:
                 reconfiguration_freq = 1
@@ -96,7 +103,9 @@ class PegInsertionSideEnv(BaseEnv):
     @property
     def _default_sensor_configs(self):
         pose = sapien_utils.look_at([0, -0.3, 0.2], [0, 0, 0.1])
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        pose_side = sapien_utils.look_at([0.5, -0.5, 0.8], [0.05, -0.1, 0.4])
+        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100),
+                CameraConfig("side_camera", pose_side, 128, 128, 1, 0.01, 100)]
 
     @property
     def _default_human_render_camera_configs(self):
@@ -128,7 +137,7 @@ class PegInsertionSideEnv(BaseEnv):
             box_hole_offsets = torch.zeros((self.num_envs, 3))
             box_hole_offsets[:, 1:] = common.to_tensor(centers)
             self.box_hole_offsets = Pose.create_from_pq(p=box_hole_offsets)
-            self.box_hole_radii = common.to_tensor(radii + self._clearance)
+            self.box_hole_radii = common.to_tensor(radii + self.clearance)
 
             # in each parallel env we build a different box with a hole and peg (the task is meant to be quite difficult)
             pegs = []
@@ -169,7 +178,7 @@ class PegInsertionSideEnv(BaseEnv):
                 # box with hole
 
                 inner_radius, outer_radius, depth = (
-                    radius + self._clearance,
+                    radius + self.clearance,
                     length,
                     length,
                 )
@@ -287,7 +296,12 @@ class PegInsertionSideEnv(BaseEnv):
         return dict(success=success, peg_head_pos_at_hole=peg_head_pos_at_hole)
 
     def _get_obs_extra(self, info: dict):
-        obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
+        obs = dict(
+            tcp_pose=self.agent.tcp.pose.raw_pose,
+            finger_contact_forces=self.agent.robot.get_net_contact_forces(
+                ["panda_leftfinger", "panda_rightfinger"]
+            ).reshape(self.num_envs, 6),
+        )
         if self.obs_mode_struct.use_state:
             obs.update(
                 peg_pose=self.peg.pose.raw_pose,

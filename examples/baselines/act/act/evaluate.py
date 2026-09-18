@@ -5,6 +5,20 @@ import torch
 
 from mani_skill.utils import common
 
+def _make_force_pre_process(stats, use_numpy: bool):
+    # only the (log-)magnitude component (index 3) gets normalized -- direction (0:3) is already a
+    # unit vector and contact (4) is already a clean 0/1 flag, matching how the dataset normalizes
+    # force at training time (see train_rgbd.py's SmallDemoDataset_ACTPolicy).
+    mag_mean = stats['force_magnitude_mean'].cpu().numpy() if use_numpy else stats['force_magnitude_mean']
+    mag_std = stats['force_magnitude_std'].cpu().numpy() if use_numpy else stats['force_magnitude_std']
+
+    def _process(f_obs):
+        f_obs = f_obs.copy() if use_numpy else f_obs.clone()
+        f_obs[..., 3:4] = (f_obs[..., 3:4] - mag_mean) / mag_std
+        return f_obs
+    return _process
+
+
 def evaluate(n: int, agent, eval_envs, eval_kwargs):
     stats, num_queries, temporal_agg, max_timesteps, device, sim_backend = eval_kwargs.values()
 
@@ -14,12 +28,16 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
     if not delta_control:
         if sim_backend == "physx_cpu":
             pre_process = lambda s_obs: (s_obs - stats['state_mean'].cpu().numpy()) / stats['state_std'].cpu().numpy()
-            if 'force_mean' in stats:
-                force_pre_process = lambda f_obs: (f_obs - stats['force_mean'].cpu().numpy()) / stats['force_std'].cpu().numpy()
+            if 'force_magnitude_mean' in stats:
+                force_pre_process = _make_force_pre_process(stats, use_numpy=True)
         else:
+            # stats (dataset.norm_stats) is built on CPU regardless of backend; move it to the
+            # eval device once here rather than per-lambda, since GPU-backend envs return obs/action
+            # tensors already on `device` and mixing devices in the arithmetic below errors out.
+            stats = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in stats.items()}
             pre_process = lambda s_obs: (s_obs - stats['state_mean']) / stats['state_std']
-            if 'force_mean' in stats:
-                force_pre_process = lambda f_obs: (f_obs - stats['force_mean']) / stats['force_std']
+            if 'force_magnitude_mean' in stats:
+                force_pre_process = _make_force_pre_process(stats, use_numpy=False)
         post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
     # create action table for temporal ensembling

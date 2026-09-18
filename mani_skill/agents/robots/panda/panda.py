@@ -87,6 +87,15 @@ class Panda(BaseAgent):
     arm_ee_rot_damping = 0.8
     arm_ee_nullspace_stiffness = 5.0
     arm_ee_joint_damping = 2.0
+
+    # NOTE (soft pd_ee_pose): unlike the compliance controller above, this still uses PhysX's
+    # implicit joint drive (like the rigid arm_pd_ee_pose), just with much lower joint-space
+    # gains, so the arm yields more under contact -- a stand-in for actuator-level compliance
+    # that avoids the qf-based compliance controller's GPU-backend instability (see git history/
+    # PR discussion). Not physically equivalent to true Cartesian impedance control, but gives a
+    # more friction-informative contact-force signal than the full-stiffness rigid controller.
+    arm_soft_stiffness = 100.0
+    arm_soft_damping = 20.0
     arm_ee_force_limit = 60.0
 
     @property
@@ -100,6 +109,15 @@ class Panda(BaseAgent):
             upper=None,
             stiffness=self.arm_stiffness,
             damping=self.arm_damping,
+            force_limit=self.arm_force_limit,
+            normalize_action=False,
+        )
+        arm_pd_joint_pos_soft = PDJointPosControllerConfig(
+            self.arm_joint_names,
+            lower=None,
+            upper=None,
+            stiffness=self.arm_soft_stiffness,
+            damping=self.arm_soft_damping,
             force_limit=self.arm_force_limit,
             normalize_action=False,
         )
@@ -144,6 +162,19 @@ class Panda(BaseAgent):
             pos_upper=2.0,
             stiffness=self.arm_stiffness,
             damping=self.arm_damping,
+            force_limit=self.arm_force_limit,
+            ee_link=self.ee_link_name,
+            urdf_path=cast(str, self.urdf_path),
+            use_delta=False,
+            normalize_action=False,
+        )
+
+        arm_pd_ee_pose_soft = PDEEPoseControllerConfig(
+            joint_names=self.arm_joint_names,
+            pos_lower=-2.0,
+            pos_upper=2.0,
+            stiffness=self.arm_soft_stiffness,
+            damping=self.arm_soft_damping,
             force_limit=self.arm_force_limit,
             ee_link=self.ee_link_name,
             urdf_path=cast(str, self.urdf_path),
@@ -241,11 +272,13 @@ class Panda(BaseAgent):
                 arm=arm_pd_joint_delta_pos, gripper=gripper_pd_joint_pos
             ),
             pd_joint_pos=dict(arm=arm_pd_joint_pos, gripper=gripper_pd_joint_pos),
+            pd_joint_pos_soft=dict(arm=arm_pd_joint_pos_soft, gripper=gripper_pd_joint_pos),
             pd_ee_delta_pos=dict(arm=arm_pd_ee_delta_pos, gripper=gripper_pd_joint_pos),
             pd_ee_delta_pose=dict(
                 arm=arm_pd_ee_delta_pose, gripper=gripper_pd_joint_pos
             ),
             pd_ee_pose=dict(arm=arm_pd_ee_pose, gripper=gripper_pd_joint_pos),
+            pd_ee_pose_soft=dict(arm=arm_pd_ee_pose_soft, gripper=gripper_pd_joint_pos),
             pd_ee_delta_pose_compliance=dict(
                 arm=arm_pd_ee_delta_pose_compliance, gripper=gripper_pd_joint_pos
             ),

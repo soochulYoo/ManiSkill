@@ -247,6 +247,15 @@ class PDEEPoseComplianceController(BaseController):
         qf = self.articulation.qf.clone()
         qf[:, self.active_joint_indices] = tau
         self.articulation.set_qf(qf)
+        if self.scene.gpu_sim_enabled:
+            # Unlike PhysX's implicit joint drive (target position/velocity, which
+            # sapien_env.py's _step_action syncs via gpu_apply_articulation_target_position/
+            # velocity whenever sets_target_qpos/sets_target_qvel is True), writes to .qf land in
+            # a staging buffer that PhysX only reads after an explicit gpu_apply_articulation_qf()
+            # call. This controller sets sets_target_qpos/sets_target_qvel = False (it drives the
+            # arm via qf, not the implicit drive) and nothing else in the step loop syncs qf, so
+            # without this call the computed torque is silently never applied on the GPU backend.
+            self.scene.px.gpu_apply_articulation_qf()
 
     def get_state(self) -> dict:
         assert self._target_pose is not None, "Target pose is not set"

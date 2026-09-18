@@ -32,6 +32,7 @@ def parse_args(args=None):
     parser.add_argument("-n", "--num-traj", type=int, default=10, help="Number of trajectories to generate.")
     parser.add_argument("--only-count-success", action="store_true", help="If true, generates trajectories until num_traj of them are successful and only saves the successful trajectories/videos")
     parser.add_argument("--reward-mode", type=str)
+    parser.add_argument("--control-mode", type=str, default="pd_joint_pos", help="Panda control mode.")
     parser.add_argument("-b", "--sim-backend", type=str, default="auto", help="Which simulation backend to use. Can be 'auto', 'cpu', 'gpu'")
     parser.add_argument("--render-mode", type=str, default="rgb_array", help="can be 'sensors' or 'rgb_array' which only affect what is saved to videos")
     parser.add_argument("--vis", action="store_true", help="whether or not to open a GUI to visualize the solution live")
@@ -49,7 +50,7 @@ def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
     env_id = args.env_id
     env_kwargs: dict[str, Any] = dict(
         obs_mode=args.obs_mode,
-        control_mode="pd_joint_pos",
+        control_mode=args.control_mode,
         render_mode=args.render_mode,
         sensor_configs=dict(shader_pack=args.shader),
         human_render_camera_configs=dict(shader_pack=args.shader),

@@ -173,6 +173,13 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
     def observation(self, observation: Dict):
         sensor_data = observation.pop("sensor_data")
         del observation["sensor_param"]
+        # Drop controller-internal state (e.g. pd_ee_pose_compliance's target_pose) from the
+        # flattened state vector so the policy's input dim stays fixed across control modes --
+        # only controllers that override get_state() (compliance controllers, not plain
+        # pd_ee_pose) add anything here. This lets a policy trained with one control mode be
+        # evaluated under a different one (e.g. training with pd_ee_pose, evaluating with
+        # pd_ee_pose_compliance to get friction-reactive behavior) without a shape mismatch.
+        observation["agent"].pop("controller", None)
         force = None
         if self.include_force:
             force = decompose_force(observation["extra"].pop("finger_contact_forces"))

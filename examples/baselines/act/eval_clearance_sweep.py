@@ -1,6 +1,14 @@
 """
-Evaluates and compares trained ACT checkpoints across a sweep of table friction / object density
-conditions, tracking success rate and return per condition, and saves a comparison plot.
+Evaluates and compares trained ACT checkpoints across a sweep of PegInsertionSide-v1 hole
+clearance conditions, tracking success rate and return per condition, and saves a comparison plot.
+
+Adapted from eval_friction_sweep.py (same CLI shape / TTT mechanics), swapping the swept physical
+quantity from table friction to hole clearance: `clearance` is the gap (m) between the peg's
+radius and the hole's inner radius (see mani_skill/envs/tasks/tabletop/peg_insertion_side.py) --
+smaller clearance means a tighter fit (less room for error, more reliant on contact/force feedback
+to insert successfully), larger clearance means a looser, easier fit. Training demos are collected
+under the env's default clearance (0.003); only eval varies it, same pattern PushCube/PullCube use
+for their friction sweep.
 
 Compares up to 4 cases (only the ones with a checkpoint path given are run):
   - no_force:          ACT trained without any force input (--ckpt-no-force)
@@ -22,7 +30,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -38,16 +46,8 @@ from mani_skill.utils import common, gym_utils
 import train_rgbd
 from train_rgbd import Agent, FlattenRGBDObservationWrapper
 
-# same sweep as scripts/data_generation/motionplanning_friction_density.sh
-DEFAULT_CONDITIONS: List[Tuple[float, float, float]] = [
-    (1000.0, 0.5, 0.35),
-    (1000.0, 1.0, 0.7),
-    (1000.0, 2.0, 1.4),
-    (1000.0, 3.3, 2.3),
-    (1000.0, 4.5, 3.15),
-    (1000.0, 6.0, 4.2),
-    (1000.0, 8.0, 5.6),
-]
+# brackets the 0.003 training-default clearance: near-zero-slop tight fit up to a loose fit
+DEFAULT_CONDITIONS: List[float] = [0.0005, 0.001, 0.002, 0.003, 0.005, 0.008, 0.01]
 
 CASE_NAMES = {
     "no_force": "ACT w/o force",
@@ -59,7 +59,7 @@ CASE_NAMES = {
 
 @dataclass
 class Args:
-    env_id: str = "PushCube-v1"
+    env_id: str = "PegInsertionSide-v1"
     control_mode: str = "pd_joint_pos"
 
     ckpt_no_force: Optional[str] = None
@@ -111,7 +111,7 @@ class Args:
     one used for the other cases) without changing what no_force/force/force_head_no_ttt run
     under. Defaults to control_mode (i.e. no override) if unset."""
 
-    output_dir: str = "runs/friction_sweep_eval"
+    output_dir: str = "runs/clearance_sweep_eval"
 
 
 def build_agent(env, args: Args, include_force: bool, use_force_magnitude_head: bool, device) -> Agent:
@@ -124,16 +124,13 @@ def build_agent(env, args: Args, include_force: bool, use_force_magnitude_head: 
     return Agent(env, agent_args).to(device)
 
 
-def make_condition_envs(args: Args, condition, include_force, run_name_suffix, control_mode=None):
-    density, static_f, dynamic_f = condition
+def make_condition_envs(args: Args, clearance: float, include_force, run_name_suffix, control_mode=None):
     env_kwargs = dict(
         control_mode=control_mode if control_mode is not None else args.control_mode,
         reward_mode="normalized_dense",
         obs_mode="rgbd" if args.include_depth else "rgb",
         render_mode="rgb_array",
-        obj_density=density,
-        static_friction=static_f,
-        dynamic_friction=dynamic_f,
+        clearance=clearance,
     )
     if args.max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -151,7 +148,7 @@ def evaluate_with_ttt(n, agent: Agent, eval_envs, norm_stats, args: Args, device
     policy (action_head, backbone, transformer, etc.) is never updated during eval."""
     stats = norm_stats
     delta_control = not stats
-    assert not delta_control, "friction sweep eval assumes an absolute (non-delta) control mode"
+    assert not delta_control, "clearance sweep eval assumes an absolute (non-delta) control mode"
 
     def _make_force_pre_process(use_numpy: bool):
         # only the (log-)magnitude component (index 3) gets normalized -- direction (0:3) is
@@ -332,12 +329,11 @@ def run_case(case: str, ckpt_path: str, args: Args, device):
     use_ttt = case == "force_head_ttt"
 
     condition_results = {}
-    for condition in DEFAULT_CONDITIONS:
-        density, static_f, dynamic_f = condition
-        label = f"static={static_f}"
-        print(f"  condition density={density} static={static_f} dynamic={dynamic_f}")
+    for clearance in DEFAULT_CONDITIONS:
+        label = f"clearance={clearance}"
+        print(f"  condition clearance={clearance}")
         control_mode = args.control_mode_ttt if (use_ttt and args.control_mode_ttt is not None) else None
-        envs = make_condition_envs(args, condition, include_force, run_name_suffix=f"{case}_{static_f}",
+        envs = make_condition_envs(args, clearance, include_force, run_name_suffix=f"{case}_{clearance}",
                                     control_mode=control_mode)
 
         agent = build_agent(envs, args, include_force, use_force_magnitude_head, device)
@@ -354,7 +350,7 @@ def run_case(case: str, ckpt_path: str, args: Args, device):
         mean_return = float(np.mean(metrics[return_key])) if return_key else float("nan")
         print(f"    success_rate={success_rate:.4f} mean_return={mean_return:.4f}")
         condition_results[label] = dict(
-            density=density, static_friction=static_f, dynamic_friction=dynamic_f,
+            clearance=clearance,
             success_rate=success_rate, mean_return=mean_return,
         )
     return condition_results
@@ -362,7 +358,7 @@ def run_case(case: str, ckpt_path: str, args: Args, device):
 
 def plot_results(all_results: dict, output_dir: str):
     conditions = list(next(iter(all_results.values())).keys())
-    x = [all_results[list(all_results.keys())[0]][c]["static_friction"] for c in conditions]
+    x = [all_results[list(all_results.keys())[0]][c]["clearance"] for c in conditions]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     for case, condition_results in all_results.items():
@@ -371,20 +367,20 @@ def plot_results(all_results: dict, output_dir: str):
         axes[0].plot(x, success, marker="o", label=CASE_NAMES[case])
         axes[1].plot(x, ret, marker="o", label=CASE_NAMES[case])
 
-    axes[0].set_xlabel("static friction")
+    axes[0].set_xlabel("hole clearance (m)")
     axes[0].set_ylabel("success rate")
-    axes[0].set_title("Success rate vs. table friction")
+    axes[0].set_title("Success rate vs. hole clearance")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].set_xlabel("static friction")
+    axes[1].set_xlabel("hole clearance (m)")
     axes[1].set_ylabel("mean return")
-    axes[1].set_title("Return vs. table friction")
+    axes[1].set_title("Return vs. hole clearance")
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    plot_path = os.path.join(output_dir, "friction_sweep_comparison.png")
+    plot_path = os.path.join(output_dir, "clearance_sweep_comparison.png")
     fig.savefig(plot_path, dpi=150)
     print(f"\nSaved plot to {plot_path}")
 
@@ -417,7 +413,7 @@ if __name__ == "__main__":
     for case, ckpt_path in cases_to_run:
         all_results[case] = run_case(case, ckpt_path, args, device)
 
-    results_path = os.path.join(args.output_dir, "friction_sweep_results.json")
+    results_path = os.path.join(args.output_dir, "clearance_sweep_results.json")
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nSaved results to {results_path}")

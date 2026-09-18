@@ -29,6 +29,13 @@ class PullCubeEnv(BaseEnv):
 
     **Success Conditions:**
     - the cube's xy position is within goal_radius (default 0.1) of the target's xy position by euclidean distance.
+
+    **Configurable Parameters:**
+    - `obj_density`: density (kg/m^3) of the cube, default 1000.
+    - `static_friction` / `dynamic_friction`: friction coefficients of the table surface, defaults 3.3/2.3.
+      Useful for domain randomization / OOD data collection across friction conditions. Note the cube
+      itself keeps its own default material, so the effective cube-table contact friction is PhysX's
+      combination of the two, not exactly these values.
     """
 
     _sample_video_link = "https://github.com/mani-skill/ManiSkill/raw/main/figures/environment_demos/PullCube-v1_rt.mp4"
@@ -37,8 +44,11 @@ class PullCubeEnv(BaseEnv):
     goal_radius = 0.1
     cube_half_size = 0.02
 
-    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
+    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, obj_density=1000.0, static_friction=3.3, dynamic_friction=2.3, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
+        self.obj_density = obj_density
+        self.static_friction = static_friction
+        self.dynamic_friction = dynamic_friction
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -58,17 +68,25 @@ class PullCubeEnv(BaseEnv):
         self.table_scene = TableSceneBuilder(
             env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
         )
-        self.table_scene.build()
+        table_material = self.table_scene.create_table_material(
+            static_friction=self.static_friction, dynamic_friction=self.dynamic_friction
+        )
+        self.table_scene.build(table_material=table_material)
 
         # create cube
-        self.obj = actors.build_cube(
-            self.scene,
-            half_size=self.cube_half_size,
-            color=np.array([12, 42, 160, 255]) / 255,
-            name="cube",
-            body_type="dynamic",
-            initial_pose=sapien.Pose(p=[0, 0, self.cube_half_size]),
+        builder = self.scene.create_actor_builder()
+        builder.add_box_collision(
+            half_size=[self.cube_half_size] * 3,
+            density=self.obj_density,
         )
+        builder.add_box_visual(
+            half_size=[self.cube_half_size] * 3,
+            material=sapien.render.RenderMaterial(
+                base_color=np.array([12, 42, 160, 255]) / 255
+            ),
+        )
+        builder.set_initial_pose(sapien.Pose(p=[0, 0, self.cube_half_size]))
+        self.obj = builder.build(name="cube")
 
         # create target
         self.goal_region = actors.build_red_white_target(
@@ -118,6 +136,9 @@ class PullCubeEnv(BaseEnv):
         obs = dict(
             tcp_pose=self.agent.tcp.pose.raw_pose,
             goal_pos=self.goal_region.pose.p,
+            finger_contact_forces=self.agent.robot.get_net_contact_forces(
+                ["panda_leftfinger", "panda_rightfinger"]
+            ).reshape(self.num_envs, 6),
         )
         if self.obs_mode_struct.use_state:
             obs.update(

@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=pushcube_demo_collection
-#SBATCH --partition=suma_rtx4090
 #SBATCH --exclude=cs-gpu-01
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4

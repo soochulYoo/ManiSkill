@@ -43,7 +43,7 @@ for i in "${INDICES[@]}"; do
         python -m mani_skill.examples.motionplanning.panda.run \
             --env-id "$env_id" \
             --traj-name="trajectory" \
-            -n 100 \
+            -n 600 \
             --only-count-success \
             --obj-density "$DENSITY" \
             --static-friction "$STATIC" \
